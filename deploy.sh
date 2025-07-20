@@ -1,18 +1,16 @@
 #!/usr/bin/env bash
-
 set -euo pipefail
 
 # ========== Configuration ==========
-export AWS_REGION=""
+export AWS_REGION="ap-south-1"
 export AWS_ACCOUNT_ID=""
-export LAMBDA_ROLE_ARN=""
+export LAMBDA_ROLE_ARN="arn:aws:iam::${AWS_ACCOUNT_ID}:role/Snipzy"
 export REPO_NAME="snipzy-worker"
 export TAG="latest"
 export FUNCTION_NAME="${REPO_NAME}-${TAG}"
+export S3_BUCKET="${REPO_NAME}-deploy-bucket"
+export S3_KEY="package.zip"
 # ====================================
-
-# Use private ECR format
-IMAGE_URI="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$REPO_NAME:$TAG"
 
 echo "→ Preparing layers…"
 mkdir -p layers/ffmpeg-layer/bin layers/ytdlp-layer/bin
@@ -39,90 +37,93 @@ echo "→ Verifying binaries…"
 ls -lh layers/ffmpeg-layer/bin/
 ls -lh layers/ytdlp-layer/bin/
 
-echo "→ Building Docker image…"
-docker build -t $REPO_NAME:$TAG .
+echo "→ Building Go binary…"
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap ./cmd/main.go
 
-echo "→ Tagging and pushing to Private ECR…"
-echo "  • Authenticating to private ECR..."
+echo "→ Packaging deployment ZIP…"
+rm -f package.zip
+zip -r package.zip bootstrap layers/ffmpeg-layer/bin layers/ytdlp-layer/bin
 
-# Authenticate to private ECR
-export DOCKER_CONFIG=$(mktemp -d)
-aws ecr get-login-password --region $AWS_REGION \
-  | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
+echo "→ Ensuring S3 bucket exists…"
+aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION" --create-bucket-configuration LocationConstraint="$AWS_REGION" 2>/dev/null || echo "  ℹ Bucket already exists"
 
-# Create private repository if it doesn't exist
-aws ecr create-repository \
-  --repository-name $REPO_NAME \
-  --region $AWS_REGION \
-  --image-scanning-configuration scanOnPush=true \
-  2>/dev/null || echo "  ℹ Private repository already exists"
-
-docker tag $REPO_NAME:$TAG $IMAGE_URI
-echo "  • Pushing $IMAGE_URI…"
-docker push $IMAGE_URI
-
-# Cleanup temporary config
-rm -rf "$DOCKER_CONFIG"
-unset DOCKER_CONFIG
+echo "→ Uploading package to S3…"
+aws s3 cp package.zip s3://"$S3_BUCKET"/"$S3_KEY" --region "$AWS_REGION"
 
 echo "→ Checking if Lambda function exists…"
 FUNCTION_EXISTS=false
-if aws lambda get-function --function-name $FUNCTION_NAME --region $AWS_REGION &>/dev/null; then
+CURRENT_PACKAGE_TYPE=""
+
+if aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" &>/dev/null; then
   FUNCTION_EXISTS=true
-  echo "  ✓ Function exists, updating code…"
+  CURRENT_PACKAGE_TYPE=$(aws lambda get-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION" --query 'Configuration.PackageType' --output text)
+  echo "  ✓ Function exists with package type: $CURRENT_PACKAGE_TYPE"
+  
+  if [[ "$CURRENT_PACKAGE_TYPE" == "Image" ]]; then
+    echo "  • Function is currently Image-based, recreating as Zip-based…"
+    aws lambda delete-function --function-name "$FUNCTION_NAME" --region "$AWS_REGION"
+    echo "  ✓ Existing Image function deleted"
+    sleep 5
+    FUNCTION_EXISTS=false
+  fi
+fi
+
+if [[ "$FUNCTION_EXISTS" == "true" && "$CURRENT_PACKAGE_TYPE" == "Zip" ]]; then
+  echo "  ✓ Updating existing Zip-based function…"
   
   aws lambda update-function-code \
-    --function-name $FUNCTION_NAME \
-    --image-uri $IMAGE_URI \
-    --region $AWS_REGION
+    --function-name "$FUNCTION_NAME" \
+    --s3-bucket "$S3_BUCKET" \
+    --s3-key "$S3_KEY" \
+    --region "$AWS_REGION"
   
   echo "  • Waiting for function update to complete…"
   aws lambda wait function-updated \
-    --function-name $FUNCTION_NAME \
-    --region $AWS_REGION
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION"
   
   echo "  ✓ Function code updated successfully"
   
 else
-  echo "  • Function doesn't exist, creating new function…"
+  echo "  • Creating new Zip-based Lambda function…"
   
   aws lambda create-function \
-    --function-name $FUNCTION_NAME \
-    --package-type Image \
-    --code ImageUri=$IMAGE_URI \
-    --role $LAMBDA_ROLE_ARN \
+    --function-name "$FUNCTION_NAME" \
+    --runtime provided.al2023 \
+    --handler bootstrap \
+    --package-type Zip \
+    --code S3Bucket="$S3_BUCKET",S3Key="$S3_KEY" \
+    --role "$LAMBDA_ROLE_ARN" \
     --timeout 900 \
     --memory-size 2048 \
     --environment Variables="{FFMPEG_PATH=/opt/bin/ffmpeg,YTDLP_PATH=/opt/bin/yt-dlp,MAX_CLIP_DURATION=30,ENVIRONMENT=dev}" \
     --ephemeral-storage '{"Size":10240}' \
     --architectures x86_64 \
-    --region $AWS_REGION
-
+    --region "$AWS_REGION"
+  
   echo "  • Waiting for function to be active…"
   aws lambda wait function-active \
-    --function-name $FUNCTION_NAME \
-    --region $AWS_REGION
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION"
   
   echo "  ✓ Function created successfully"
 fi
 
 echo "→ Checking Function URL configuration…"
 FUNCTION_URL=""
-if aws lambda get-function-url-config --function-name $FUNCTION_NAME --region $AWS_REGION &>/dev/null; then
+if aws lambda get-function-url-config --function-name "$FUNCTION_NAME" --region "$AWS_REGION" &>/dev/null; then
   echo "  ✓ Function URL already exists"
   FUNCTION_URL=$(aws lambda get-function-url-config \
-    --function-name $FUNCTION_NAME \
-    --region $AWS_REGION \
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION" \
     --query FunctionUrl --output text)
 else
   echo "  • Creating Function URL with streaming support…"
-  
-  # Create function URL with streaming support
   if aws lambda create-function-url-config \
-    --function-name $FUNCTION_NAME \
+    --function-name "$FUNCTION_NAME" \
     --auth-type NONE \
     --invoke-mode RESPONSE_STREAM \
-    --region $AWS_REGION > /tmp/function-url-config.json 2>&1; then
+    --region "$AWS_REGION" > /tmp/function-url-config.json 2>&1; then
     
     FUNCTION_URL=$(grep -o '"FunctionUrl":"[^"]*"' /tmp/function-url-config.json | cut -d'"' -f4)
     echo "  ✓ Function URL created successfully"
@@ -131,8 +132,7 @@ else
     cat /tmp/function-url-config.json
     FUNCTION_URL=""
   fi
-  
-  # Cleanup
+
   rm -f /tmp/function-url-config.json
 fi
 
@@ -140,12 +140,11 @@ echo ""
 echo "✅ Deployment completed successfully!"
 echo ""
 
-# Show function details
 echo "📋 Function Details:"
 aws lambda get-function \
-  --function-name $FUNCTION_NAME \
-  --region $AWS_REGION \
-  --query 'Configuration.[FunctionName,State,LastModified,MemorySize,Timeout]' \
+  --function-name "$FUNCTION_NAME" \
+  --region "$AWS_REGION" \
+  --query 'Configuration.[FunctionName,State,LastModified,MemorySize,Timeout,PackageType]' \
   --output table
 
 echo ""
