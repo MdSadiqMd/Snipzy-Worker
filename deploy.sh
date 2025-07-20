@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# First Started using Private ECR but it costs a lot
+# Next moved to Public ECR, but it only works when both lambda and ecr are in same region, and public ECR are for namesake global but they only work in us-east-1, us-central-1
+# Next moved to Docker Hub, but AWS needs vendor lock in and it won't allow us to use external container image services
+# Next moved to S3, packaging all the code with ffmpeg and ytdlp binaries and uplaoding to S3 and use it when needed
 set -euo pipefail
 
 # ========== Configuration ==========
