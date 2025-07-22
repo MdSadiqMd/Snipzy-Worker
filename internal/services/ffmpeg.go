@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strconv"
 
+	"github.com/MdSadiqMd/snipzy-worker/internal/dto"
 	"github.com/MdSadiqMd/snipzy-worker/internal/server"
 	"github.com/MdSadiqMd/snipzy-worker/pkg/config"
 )
@@ -18,26 +19,12 @@ type FFmpegService struct {
 	config *config.Config
 }
 
-type ProcessingOptions struct {
-	StartTime    float64
-	Duration     float64
-	Platform     string
-	Quality      string
-	OutputFormat string
-}
-
-type PlatformPreset struct {
-	Width        int
-	Height       int
-	FilterString string
-}
-
 func NewFFmpegService(cfg *config.Config) *FFmpegService {
 	return &FFmpegService{config: cfg}
 }
 
-func (s *FFmpegService) GetPlatformPresets() map[string]PlatformPreset {
-	return map[string]PlatformPreset{
+func (s *FFmpegService) GetPlatformPresets() map[string]dto.PlatformPreset {
+	return map[string]dto.PlatformPreset{
 		"instagram-feed": {
 			Width:        1080,
 			Height:       1080,
@@ -66,7 +53,7 @@ func (s *FFmpegService) GetPlatformPresets() map[string]PlatformPreset {
 	}
 }
 
-func (s *FFmpegService) ProcessVideoStream(ctx context.Context, directURL string, options ProcessingOptions) (io.ReadCloser, error) {
+func (s *FFmpegService) ProcessVideoStream(ctx context.Context, directURL string, options dto.ProcessingOptions) (io.ReadCloser, error) {
 	preset, exists := s.GetPlatformPresets()[options.Platform]
 	if !exists {
 		preset = s.GetPlatformPresets()["default"]
@@ -89,24 +76,10 @@ func (s *FFmpegService) ProcessVideoStream(ctx context.Context, directURL string
 		return nil, fmt.Errorf("failed to start ffmpeg: %w", err)
 	}
 
-	return &processReader{
-		reader: stdout,
-		cmd:    cmd,
+	return &dto.ProcessReader{
+		Reader: stdout,
+		Cmd:    cmd,
 	}, nil
-}
-
-type processReader struct {
-	reader io.ReadCloser
-	cmd    *exec.Cmd
-}
-
-func (pr *processReader) Read(p []byte) (n int, err error) {
-	return pr.reader.Read(p)
-}
-
-func (pr *processReader) Close() error {
-	pr.reader.Close()
-	return pr.cmd.Wait()
 }
 
 func (s *FFmpegService) downloadVideoSegment(ctx context.Context, url, outputPath string, startTime, duration float64) error {
@@ -153,7 +126,7 @@ func (s *FFmpegService) downloadVideoSegment(ctx context.Context, url, outputPat
 	return err
 }
 
-func (s *FFmpegService) buildFFmpegArgs(inputFile string, options ProcessingOptions, preset PlatformPreset) []string {
+func (s *FFmpegService) buildFFmpegArgs(inputFile string, options dto.ProcessingOptions, preset dto.PlatformPreset) []string {
 	args := []string{
 		"-ss", strconv.FormatFloat(options.StartTime, 'f', 2, 64),
 		"-i", inputFile,
