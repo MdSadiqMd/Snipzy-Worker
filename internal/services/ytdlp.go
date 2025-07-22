@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strings"
 
+	"github.com/MdSadiqMd/snipzy-worker/internal/dto"
 	"github.com/MdSadiqMd/snipzy-worker/pkg/config"
 )
 
@@ -14,29 +15,11 @@ type YTDLPService struct {
 	config *config.Config
 }
 
-type VideoInfo struct {
-	URL       string   `json:"url"`
-	Title     string   `json:"title"`
-	Duration  float64  `json:"duration"`
-	Formats   []Format `json:"formats"`
-	DirectURL string   `json:"direct_url,omitempty"`
-}
-
-type Format struct {
-	FormatID   string `json:"format_id"`
-	URL        string `json:"url"`
-	Width      int    `json:"width,omitempty"`
-	Height     int    `json:"height,omitempty"`
-	Filesize   int64  `json:"filesize,omitempty"`
-	VideoCodec string `json:"vcodec,omitempty"`
-	AudioCodec string `json:"acodec,omitempty"`
-}
-
 func NewYTDLPService(cfg *config.Config) *YTDLPService {
 	return &YTDLPService{config: cfg}
 }
 
-func (s *YTDLPService) GetVideoInfo(ctx context.Context, videoURL string) (*VideoInfo, error) {
+func (s *YTDLPService) GetVideoInfo(ctx context.Context, videoURL string) (*dto.VideoInfo, error) {
 	cmd := exec.CommandContext(ctx, s.config.YTDLPPath,
 		"-g",
 		"-j",
@@ -54,7 +37,7 @@ func (s *YTDLPService) GetVideoInfo(ctx context.Context, videoURL string) (*Vide
 		return nil, fmt.Errorf("invalid yt-dlp output")
 	}
 
-	var info VideoInfo
+	var info dto.VideoInfo
 	if err := json.Unmarshal([]byte(lines[0]), &info); err != nil {
 		return nil, fmt.Errorf("failed to parse video info: %w", err)
 	}
@@ -79,7 +62,7 @@ func (s *YTDLPService) GetVideoURLWithTimeRange(ctx context.Context, videoURL st
 	return strings.TrimSpace(string(output)), nil
 }
 
-func (s *YTDLPService) CalculateByteRange(info *VideoInfo, startTime, duration float64) (start, end int64) {
+func (s *YTDLPService) CalculateByteRange(info *dto.VideoInfo, startTime, duration float64) (start, end int64) {
 	if info.Duration <= 0 {
 		return 0, 1024 * 1024
 	}
