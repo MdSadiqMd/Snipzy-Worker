@@ -2,7 +2,7 @@
 # First Started using Private ECR but it costs a lot
 # Next moved to Public ECR, but it only works when both lambda and ecr are in same region, and public ECR are for namesake global but they only work in us-east-1, us-central-1
 # Next moved to Docker Hub, but AWS needs vendor lock in and it won't allow us to use external container image services
-# Next moved to S3, packaging all the code with ffmpeg and ytdlp binaries and uplaoding to S3 and use it when needed
+# Next moved to S3, packaging all the code with ffmpeg and ytdlp binaries and uplaoding to S3 and use it when needed, still costs, but very cheap
 set -euo pipefail
 
 # ========== Configuration ==========
@@ -46,7 +46,15 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -tags lambda.norpc -o bootstrap .
 
 echo "→ Packaging deployment ZIP…"
 rm -f package.zip
-zip -r package.zip bootstrap layers/ffmpeg-layer/bin layers/ytdlp-layer/bin
+
+mkdir -p bin
+cp bootstrap bin/
+cp layers/ffmpeg-layer/bin/ffmpeg bin/
+cp layers/ffmpeg-layer/bin/ffprobe bin/
+cp layers/ytdlp-layer/bin/yt-dlp bin/
+chmod +x bin/*
+zip -r package.zip bin/
+rm -rf bin/
 
 echo "→ Ensuring S3 bucket exists…"
 aws s3api create-bucket --bucket "$S3_BUCKET" --region "$AWS_REGION" --create-bucket-configuration LocationConstraint="$AWS_REGION" 2>/dev/null || echo "  ℹ Bucket already exists"
@@ -86,8 +94,19 @@ if [[ "$FUNCTION_EXISTS" == "true" && "$CURRENT_PACKAGE_TYPE" == "Zip" ]]; then
     --function-name "$FUNCTION_NAME" \
     --region "$AWS_REGION"
   
-  echo "  ✓ Function code updated successfully"
+  echo "  • Updating environment variables…"
+  aws lambda update-function-configuration \
+    --function-name "$FUNCTION_NAME" \
+    --environment Variables="{FFMPEG_PATH=/var/task/bin/ffmpeg,YTDLP_PATH=/var/task/bin/yt-dlp,MAX_CLIP_DURATION=30,ENVIRONMENT=dev}" \
+    --region "$AWS_REGION"
+    
+  echo "  • Waiting for configuration update to complete…"
+  aws lambda wait function-updated \
+    --function-name "$FUNCTION_NAME" \
+    --region "$AWS_REGION"
   
+  echo "  ✓ Function code and configuration updated successfully"
+
 else
   echo "  • Creating new Zip-based Lambda function…"
   
@@ -100,7 +119,7 @@ else
     --role "$LAMBDA_ROLE_ARN" \
     --timeout 900 \
     --memory-size 2048 \
-    --environment Variables="{FFMPEG_PATH=/opt/bin/ffmpeg,YTDLP_PATH=/opt/bin/yt-dlp,MAX_CLIP_DURATION=30,ENVIRONMENT=dev}" \
+    --environment Variables="{FFMPEG_PATH=/var/task/bin/ffmpeg,YTDLP_PATH=/var/task/bin/yt-dlp,MAX_CLIP_DURATION=30,ENVIRONMENT=dev}" \
     --ephemeral-storage '{"Size":10240}' \
     --architectures x86_64 \
     --region "$AWS_REGION"
@@ -122,21 +141,16 @@ if aws lambda get-function-url-config --function-name "$FUNCTION_NAME" --region 
     --region "$AWS_REGION" \
     --query FunctionUrl --output text)
 else
-  echo "  • Creating Function URL with streaming support…"
-  if aws lambda create-function-url-config \
+  echo "  • Creating Function URL with streaming support and CORS…"
+  aws lambda create-function-url-config \
     --function-name "$FUNCTION_NAME" \
     --auth-type NONE \
     --invoke-mode RESPONSE_STREAM \
-    --region "$AWS_REGION" > /tmp/function-url-config.json 2>&1; then
-    
-    FUNCTION_URL=$(grep -o '"FunctionUrl":"[^"]*"' /tmp/function-url-config.json | cut -d'"' -f4)
-    echo "  ✓ Function URL created successfully"
-  else
-    echo "  ❌ Failed to create Function URL:"
-    cat /tmp/function-url-config.json
-    FUNCTION_URL=""
-  fi
+    --cors '{"AllowOrigins":["*"],"AllowMethods":["POST","OPTIONS","GET"],"AllowHeaders":["Content-Type","Authorization"],"MaxAge":86400}' \
+    --region "$AWS_REGION" > /tmp/function-url-config.json
 
+  FUNCTION_URL=$(grep -o '"FunctionUrl":"[^"]*"' /tmp/function-url-config.json | cut -d'"' -f4)
+  echo "  ✓ Function URL created successfully with CORS"
   rm -f /tmp/function-url-config.json
 fi
 
